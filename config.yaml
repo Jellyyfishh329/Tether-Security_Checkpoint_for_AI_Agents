@@ -1,0 +1,26 @@
+# Tether family safety policy.
+# Amounts are in Indian rupees (INR).
+
+spending_limit: 500
+
+allowed_recipients:
+  - "priya@family.com"
+  - "dr.sharma@clinic.com"
+  - "bescom@utility.in"
+
+blocked_keywords:
+  - "ignore previous"
+  - "forward all"
+  - "system override"
+  - "send all invoices"
+  - "transfer everything"
+  - "bypass"
+
+primary_approver:
+  name: "Daughter (Ananya)"
+  contact: "ananya_tg"
+  timeout_sec: 10
+
+backup_approver:
+  name: "Son (Rohan)"
+  contact: "rohan_tg"

@@ -1,0 +1,6 @@
+data/*.json
+data/pending/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

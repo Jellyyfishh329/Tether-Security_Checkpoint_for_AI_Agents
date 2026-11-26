@@ -102,7 +102,7 @@ def run_grandmother_demo() -> None:
 
     balance = mock_apps.get_full_state()["bank"]["balance"]
     print(f"\nCurrent family balance: Rs {balance:,.2f}")
-    print("\nDemo complete. Option 2 can undo the last allowed action; option 4 opens the feed.")
+    print("\nDemo complete. Option 2 tries to undo the last action (Tether refuses to undo a payment); option 4 opens the feed.")
 
 
 def run_undo() -> None:

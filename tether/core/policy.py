@@ -68,6 +68,8 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
     config["allowed_recipients"] = [
         _normalise_address(item) for item in config["allowed_recipients"]
     ]
+    config["hard_limit"] = float(config.get("hard_limit", 10000))
+    config["injection_patterns"] = [str(x) for x in config.get("injection_patterns") or []]
     config["blocked_keywords"] = [
         str(item).strip() for item in config["blocked_keywords"] if str(item).strip()
     ]
@@ -112,6 +114,21 @@ def _find_blocked_keyword(text: str, keywords: list[str]) -> str | None:
     return None
 
 
+def scan_text(text: str, config: dict[str, Any] | None = None) -> str | None:
+    """Return the first injection signal found in ``text`` (keyword or regex), else None.
+
+    Used on tool *arguments* and on tool *results* (e.g. an email body the agent read).
+    """
+    config = config or load_config()
+    keyword = _find_blocked_keyword(text, config["blocked_keywords"])
+    if keyword is not None:
+        return f"keyword '{keyword}'"
+    for pattern in config["injection_patterns"]:
+        if re.search(pattern, text, re.IGNORECASE | re.DOTALL):
+            return f"pattern /{pattern[:40]}.../"
+    return None
+
+
 def llm_injection_scan(text: str) -> bool:
     """Optional LLM-backed injection classifier hook.
 
@@ -136,7 +153,11 @@ def llm_injection_scan(text: str) -> bool:
     return False
 
 
-def evaluate_action(tool_name: str, args: dict[str, Any]) -> PolicyResult:
+IRREVERSIBLE_TOOLS = {"pay_bill", "send_email"}
+WRITE_TOOLS = {"book_appointment", "add_sheet_row", "draft_email"}
+
+
+def evaluate_action(tool_name: str, args: dict[str, Any], tainted: bool = False) -> PolicyResult:
     """Evaluate a tool call against injection and family spending policy.
 
     Returns:
@@ -147,16 +168,21 @@ def evaluate_action(tool_name: str, args: dict[str, Any]) -> PolicyResult:
     config = load_config()
     flattened = "\n".join(_iter_strings(args))
 
-    matched_keyword = _find_blocked_keyword(flattened, config["blocked_keywords"])
-    if matched_keyword is not None:
-        return "BLOCKED", f"Blocked keyword detected: '{matched_keyword}'"
+    signal = scan_text(flattened, config)
+    if signal is not None:
+        return "BLOCKED", f"Injection signal detected: {signal}"
+
+    # Taint: this session read content that looked like an attack. Do not let it
+    # do anything that cannot be undone, and have a human look at everything else.
+    if tainted and tool_name in IRREVERSIBLE_TOOLS:
+        return "BLOCKED", "Session is tainted by suspicious content it read; irreversible actions are blocked"
 
     if llm_injection_scan(flattened):
         return "BLOCKED", "LLM injection classifier flagged this request"
 
     allowed_recipients = set(config["allowed_recipients"])
 
-    if tool_name == "draft_email":
+    if tool_name in ("draft_email", "send_email"):
         recipient = _normalise_address(args.get("to", ""))
         if recipient not in allowed_recipients:
             shown = recipient or "<missing>"
@@ -164,6 +190,12 @@ def evaluate_action(tool_name: str, args: dict[str, Any]) -> PolicyResult:
                 "BLOCKED",
                 f"Recipient '{shown}' is not on the family allowlist",
             )
+
+    if tainted and tool_name in WRITE_TOOLS:
+        return "NEEDS_HUMAN", "Session is tainted by suspicious content it read; family approval required"
+
+    if tool_name == "send_email":
+        return "NEEDS_HUMAN", "Sending email is irreversible; family approval required"
 
     if tool_name == "pay_bill":
         raw_amount = args.get("amount")
@@ -173,6 +205,9 @@ def evaluate_action(tool_name: str, args: dict[str, Any]) -> PolicyResult:
             return "BLOCKED", "Bill amount is missing or invalid"
         if isinstance(raw_amount, bool) or not math.isfinite(amount) or amount <= 0:
             return "BLOCKED", "Bill amount must be a positive, finite number"
+
+        if amount > config["hard_limit"]:
+            return "BLOCKED", f"Amount {amount:.2f} is above the hard limit of {config['hard_limit']:.2f}"
 
         payee = _normalise_address(args.get("payee", ""))
         reasons: list[str] = []
@@ -190,4 +225,4 @@ def evaluate_action(tool_name: str, args: dict[str, Any]) -> PolicyResult:
     return "ALLOWED", "Passed policy and injection checks"
 
 
-__all__ = ["Decision", "PolicyResult", "evaluate_action", "llm_injection_scan", "load_config"]
+__all__ = ["Decision", "PolicyResult", "evaluate_action", "llm_injection_scan", "load_config", "scan_text"]

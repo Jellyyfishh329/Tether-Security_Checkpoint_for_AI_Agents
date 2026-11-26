@@ -16,6 +16,58 @@ import time
 from typing import Any
 
 from tether.core.policy import load_config
+from tether.paths import data_dir
+
+# Approval mode is chosen by the OPERATOR (environment variable), never by the agent:
+#   terminal (default) - prompt in this terminal
+#   file               - write data/pending/<id>.json and wait for `python -m tether.cli approve <id>`
+#                        (works when Tether runs as an MCP server over stdio, where there is no terminal)
+#   approve / deny     - automatic, for demos and tests only
+def approver_mode() -> str:
+    return os.environ.get("TETHER_APPROVER", "terminal").strip().lower()
+
+
+def pending_dir():
+    path = data_dir() / "pending"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _wait_for_decision(request_id: str, payload: dict[str, Any], timeout_sec: float, poll: float = 0.1) -> str | None:
+    """Publish a pending request and wait for a human to answer it. None = timed out."""
+    directory = pending_dir()
+    request_file = directory / f"{request_id}.json"
+    decision_file = directory / f"{request_id}.decision"
+    request_file.write_text(__import__("json").dumps(payload, indent=2), encoding="utf-8")
+    deadline = time.monotonic() + timeout_sec
+    try:
+        while time.monotonic() < deadline:
+            if decision_file.exists():
+                return decision_file.read_text(encoding="utf-8").strip()
+            time.sleep(poll)
+        return None
+    finally:
+        for f in (request_file, decision_file):
+            try:
+                f.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _file_decision(kind: str, request_id: str, body: dict[str, Any], config: dict[str, Any]) -> tuple[str | None, str]:
+    """Ask the primary approver, then the backup. Returns (answer, who answered)."""
+    primary, backup, timeout = _approver_settings(config)
+    try:
+        backup_timeout = float(backup.get("timeout_sec", timeout))
+    except (TypeError, ValueError):
+        backup_timeout = timeout
+    for person, wait in ((primary, timeout), (backup, backup_timeout)):
+        name = str(person.get("name", "approver"))
+        payload = {"id": request_id, "kind": kind, "contact": person.get("contact"), "name": name, **body}
+        answer = _wait_for_decision(request_id, payload, wait)
+        if answer is not None:
+            return answer, name
+    return None, ""
 
 _AFFIRMATIVE = {"y", "yes", "approve", "approved", "true", "1"}
 _NEGATIVE = {"n", "no", "deny", "denied", "false", "0", ""}
@@ -115,6 +167,7 @@ def request_approval(
     action_summary: str,
     reason: str,
     auto_decision: str | None = None,
+    request_id: str = "approval",
 ) -> tuple[bool, str]:
     """Ask a family member to approve a sensitive action.
 
@@ -135,6 +188,19 @@ def request_approval(
     primary_contact = str(primary.get("contact", "unknown"))
     backup_name = str(backup.get("name", "Backup approver"))
     backup_contact = str(backup.get("contact", "unknown"))
+
+    mode = approver_mode()
+    if auto_decision is None and mode in ("approve", "deny"):
+        auto_decision = "yes" if mode == "approve" else "no"
+
+    if auto_decision is None and mode == "file":
+        answer, who = _file_decision("approval", request_id, {"action": action_summary, "reason": reason}, config)
+        if answer is None:
+            return False, f"No answer from {primary_name} or backup {backup_name}; denied by default"
+        parsed = _parse_decision(answer)
+        if parsed is True:
+            return True, f"Approved by {who}"
+        return False, f"Denied by {who}"
 
     if auto_decision is not None:
         parsed = _parse_decision(auto_decision)
@@ -185,7 +251,7 @@ def request_approval(
     )
 
 
-def ask_human_helper(question: str, auto_reply: str | None = None) -> str:
+def ask_human_helper(question: str, auto_reply: str | None = None, request_id: str = "question") -> str:
     """Ask a family member a free-form question (the "humans-as-tools" pattern).
 
     Example uses: verify a medicine label from a photo, confirm whether a person
@@ -201,6 +267,10 @@ def ask_human_helper(question: str, auto_reply: str | None = None) -> str:
     """
     if auto_reply is not None:
         return auto_reply
+
+    if approver_mode() == "file":
+        answer, who = _file_decision("question", request_id, {"question": question}, load_config())
+        return f"{who}: {answer}" if answer is not None else ""
 
     print("\n" + "-" * 64)
     print("TETHER HUMAN HELPER")

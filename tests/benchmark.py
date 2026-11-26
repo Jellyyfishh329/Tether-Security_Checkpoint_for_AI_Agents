@@ -206,30 +206,37 @@ def main() -> int:
         _print_case(index, len(NORMAL_TASKS), "Task", case, result, passed)
 
     print("\nUndo verification:")
+    # 1) The last executed action was a payment: undo must refuse and change nothing.
+    state_now = mock_apps.get_full_state()
+    refused = snapshot.undo_last()
+    refuse_pass = refused.get("status") == "REFUSED" and mock_apps.get_full_state() == state_now
+    print(f"  [{'PASS' if refuse_pass else 'FAIL'}] undo refuses an irreversible payment and changes nothing")
+
+    # 2) A reversible action is undone exactly, and the log entry is marked UNDONE.
+    state_before = mock_apps.get_full_state()
+    done = proxy.execute_tool("book_appointment", {"title": "Undo test", "date": "2026-12-02"})
     undo_result = snapshot.undo_last()
-    state_after_undo = mock_apps.get_full_state()
-    logs = snapshot.get_logs()
     undone_entry = next(
-        (
-            entry
-            for entry in reversed(logs)
-            if entry.get("action_id") == undo_result.get("action_id")
-        ),
-        None,
+        (e for e in reversed(snapshot.get_logs()) if e.get("action_id") == undo_result.get("action_id")), None
     )
     undo_pass = (
-        undo_result.get("status") == "UNDONE"
-        and state_before_last_allowed is not None
-        and state_after_undo == state_before_last_allowed
+        done.get("status") == "ALLOWED"
+        and undo_result.get("status") == "UNDONE"
+        and mock_apps.get_full_state() == state_before
         and undone_entry is not None
         and undone_entry.get("status") == "UNDONE"
     )
-    print(
-        f"  [{'PASS' if undo_pass else 'FAIL'}] undo_last() restored state before "
-        f"the final allowed action"
-    )
+    print(f"  [{'PASS' if undo_pass else 'FAIL'}] undo restores state exactly after a reversible action")
     if not undo_pass:
         print(f"         undo result: {undo_result}")
+
+    # 3) Later changes are never overwritten: an outside edit makes undo refuse.
+    proxy.execute_tool("book_appointment", {"title": "Conflict test", "date": "2026-12-03"})
+    mock_apps.add_sheet_row("Groceries", {"item": "edited outside the agent", "qty": 1})
+    conflict = snapshot.undo_last()
+    conflict_pass = conflict.get("status") == "CONFLICT" and "edited outside" in str(mock_apps.get_full_state())
+    print(f"  [{'PASS' if conflict_pass else 'FAIL'}] undo will not overwrite a later change")
+    undo_pass = undo_pass and refuse_pass and conflict_pass
 
     attack_total = len(ATTACKS)
     normal_total = len(NORMAL_TASKS)

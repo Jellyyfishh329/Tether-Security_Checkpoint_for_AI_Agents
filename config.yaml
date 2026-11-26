@@ -2,6 +2,7 @@
 # Amounts are in Indian rupees (INR).
 
 spending_limit: 500
+hard_limit: 10000   # payments above this are blocked outright, even if a human says yes
 
 allowed_recipients:
   - "priya@family.com"
@@ -14,7 +15,6 @@ blocked_keywords:
   - "system override"
   - "send all invoices"
   - "transfer everything"
-  - "bypass"
 
 primary_approver:
   name: "Daughter (Ananya)"
@@ -24,3 +24,13 @@ primary_approver:
 backup_approver:
   name: "Son (Rohan)"
   contact: "rohan_tg"
+
+# Regex patterns for injection phrasing (case-insensitive). More flexible than keywords.
+injection_patterns:
+  - 'ignore (all |any |the )?(previous|prior|above|earlier) (instructions|rules|prompts?)'
+  - 'disregard (all |any |the )?(previous|prior|above|earlier)'
+  - '\b(send|forward|email|mail|share|upload)\b.{0,40}\b(invoices?|passwords?|credentials|statements|documents|files|contacts|api keys?|secrets?)\b.{0,40}\bto\b'
+  - 'do not (tell|inform|notify|alert) the (user|owner)'
+  - '\byou (must|should) (now )?(immediately )?(transfer|pay|send|forward)\b'
+  - 'system prompt'
+  - '\b(urgent|immediately)\b.{0,30}\b(transfer|wire|pay)\b.{0,40}\b(account|upi)\b'

@@ -13,6 +13,7 @@ backend.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import threading
@@ -23,9 +24,9 @@ from typing import Any
 
 from tether.tools import mock_apps
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data"
-AUDIT_PATH = DATA_DIR / "audit_log.json"
+from tether.paths import data_dir
+
+AUDIT_PATH = None  # resolved lazily: <data dir>/audit_log.json
 
 _LOCK = threading.RLock()
 
@@ -66,9 +67,12 @@ class StorageBackend(ABC):
 class JsonStorageBackend(StorageBackend):
     """Single-file JSON storage suitable for the MVP and local demos."""
 
-    def __init__(self, path: str | Path = AUDIT_PATH) -> None:
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, path: str | Path | None = None) -> None:
+        self._path = Path(path) if path else None
+
+    @property
+    def path(self) -> Path:
+        return self._path or data_dir() / "audit_log.json"
 
     def load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -87,7 +91,7 @@ class JsonStorageBackend(StorageBackend):
         os.replace(tmp_path, self.path)
 
 
-_backend: StorageBackend = JsonStorageBackend(AUDIT_PATH)
+_backend: StorageBackend = JsonStorageBackend()
 
 
 def configure_storage(backend: StorageBackend) -> None:
@@ -136,12 +140,18 @@ def get_logs() -> list[dict[str, Any]]:
         return copy.deepcopy(_backend.load()["logs"])
 
 
-def undo_last() -> dict[str, Any]:
-    """Revert state to before the most recent executed (ALLOWED) action.
+def state_hash(state: dict[str, Any]) -> str:
+    """Stable fingerprint of the mock-app state (used to detect later changes)."""
+    return hashlib.sha256(json.dumps(state, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
-    The matching log entry is marked ``UNDONE`` (its original status is retained
-    in ``previous_status``) so repeated undo calls walk backwards through
-    history instead of undoing the same action twice.
+
+def undo_last() -> dict[str, Any]:
+    """Undo the most recent executed action, safely.
+
+    Refuses (and changes nothing) when:
+      * the action was irreversible (a payment or a sent email cannot be taken back), or
+      * the state changed after the action (undoing would overwrite someone's later work).
+    The log entry is marked UNDONE so repeated calls walk backwards, newest first.
     """
     with _LOCK:
         audit = _backend.load()
@@ -151,31 +161,34 @@ def undo_last() -> dict[str, Any]:
         target_index: int | None = None
         for index in range(len(logs) - 1, -1, -1):
             entry = logs[index]
-            if (
-                entry.get("status") == "ALLOWED"
-                and entry.get("action_id") in snapshots
-            ):
+            if entry.get("status") == "ALLOWED" and entry.get("action_id") in snapshots:
                 target_index = index
                 break
 
         if target_index is None:
-            return {
-                "status": "NOOP",
-                "reason": "No executed action is available to undo",
-            }
+            return {"status": "NOOP", "reason": "No executed action is available to undo"}
 
         entry = logs[target_index]
         action_id = str(entry["action_id"])
-        snapshot = snapshots[action_id]
-        state_before = snapshot.get("state")
-        try:
-            mock_apps.restore_full_state(state_before)
-        except (TypeError, ValueError) as exc:
+        if entry.get("irreversible"):
             return {
-                "status": "ERROR",
-                "reason": f"Snapshot could not be restored: {exc}",
+                "status": "REFUSED",
                 "action_id": action_id,
+                "tool": entry.get("tool"),
+                "reason": f"{entry.get('tool')} is irreversible and cannot be undone; contact the recipient or bank",
             }
+        after_hash = entry.get("after_hash")
+        if after_hash and state_hash(mock_apps.get_full_state()) != after_hash:
+            return {
+                "status": "CONFLICT",
+                "action_id": action_id,
+                "tool": entry.get("tool"),
+                "reason": "State changed after this action; not overwriting later changes",
+            }
+        try:
+            mock_apps.restore_full_state(snapshots[action_id].get("state"))
+        except (TypeError, ValueError) as exc:
+            return {"status": "ERROR", "reason": f"Snapshot could not be restored: {exc}", "action_id": action_id}
 
         entry["previous_status"] = entry.get("status")
         entry["status"] = "UNDONE"
@@ -193,6 +206,17 @@ def undo_last() -> dict[str, Any]:
     }
 
 
+def update_event(action_id: str, **fields: Any) -> None:
+    """Update the newest log entry with this action_id (e.g. PENDING -> final status)."""
+    with _LOCK:
+        audit = _backend.load()
+        for entry in reversed(audit["logs"]):
+            if entry.get("action_id") == action_id:
+                entry.update(fields)
+                break
+        _backend.save(audit)
+
+
 def reset_audit_log() -> None:
     """Clear snapshots and logs (used by the benchmark suite)."""
     with _LOCK:
@@ -207,6 +231,8 @@ __all__ = [
     "get_logs",
     "log_event",
     "reset_audit_log",
+    "state_hash",
+    "update_event",
     "save_snapshot",
     "undo_last",
 ]

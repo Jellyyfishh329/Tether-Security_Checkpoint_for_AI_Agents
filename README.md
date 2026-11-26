@@ -10,8 +10,8 @@ Tether sits as a transparent MCP proxy between any AI agent and its tools. It bl
 
 ## Key Features
 
-* **Policy Rules & Injection Scanning:** Every tool call is checked against a deterministic YAML policy (spending limits, allowed recipients) and scanned for hidden prompt injections using pattern matching and a secondary LLM check.
-* **State Snapshots & One-Click Undo:** Before modifying data, Tether saves a snapshot so mistakes can be rolled back cleanly. Actions that cannot be reversed (like sending emails or transferring money) use draft-and-approve workflows and strict limits.
+* **Policy Rules & Injection Scanning:** Every tool call is checked against a deterministic YAML policy (spending limits, allowed recipients) and scanned for hidden prompt injections using keyword and regex pattern matching (a secondary LLM check is planned, see below). Content the agent *reads* (e.g. an email body) is scanned too: if it looks like an attack the session becomes **tainted**, irreversible actions are blocked and writes need family approval.
+* **State Snapshots & One-Click Undo:** Before modifying data, Tether saves a snapshot so mistakes can be rolled back. Undo is safe: it refuses to undo irreversible actions (payments, sent emails) and refuses to overwrite changes made after the action. Irreversible actions use approval and strict limits instead.
 * **Humans-as-Tools (Family Escalation):** Unlike developer-focused security gateways, Tether is built for elderly and digitally inexperienced users. When an action exceeds safety limits—or when the agent needs real-world help like a photo or verification—it calls a designated family member with timeout and backup-contact fallbacks.
 * **Live Audit Feed:** A real-time web dashboard displays every intercepted action as **Allowed**, **Blocked**, **Pending**, or **Undone**, along with the exact reasoning.
 
@@ -60,12 +60,12 @@ User Request ──▶ AI Agent (Claude / MCP Client)
 | **MCP Proxy** | MCP Python SDK (`FastMCP`) | Acts as an MCP server so any MCP client connects without code changes |
 | **AI Agent** | Claude (Anthropic API) | Interprets user intent and invokes MCP tools |
 | **Policy Engine** | PyYAML + Python Checker | Deterministic rules for spending caps and allowlists |
-| **Injection Guard** | Regex Patterns + LLM Hook | Two-layer detection for hidden instructions |
-| **Storage & Undo** | JSON / SQLite | Local storage for state snapshots, undo steps, and audit logs |
-| **Approvals** | CLI Prompt (MVP) / Telegram Bot (Planned) | Sends interactive Approve/Reject prompts to family members |
+| **Injection Guard** | Keywords + regex patterns, taint tracking (LLM hook is a stub) | Detects hidden instructions in arguments and in tool results |
+| **Storage & Undo** | JSON (pluggable backend; SQLite planned) | State snapshots, undo steps, audit logs |
+| **Approvals** | Terminal prompt, or file-based (`python -m tether.cli approve <id>`, works over MCP stdio); Telegram Bot planned | Approve/Reject requests with timeout and backup contact |
 | **Live Feed UI** | FastAPI + HTML | Real-time dashboard showing allowed, blocked, pending, and undone calls |
 | **Protected Tools** | JSON-backed Mock Apps | Safe local sandboxes for Calendar, Sheets, Email Drafts, and Bank |
-| **Testing** | Python Benchmark Script | Automated suite of adversarial attack prompts and normal user tasks |
+| **Testing** | pytest + benchmark scripts | Adversarial and normal cases, undo safety, approval flow |
 
 ---
 
@@ -77,10 +77,13 @@ User Request ──▶ AI Agent (Claude / MCP Client)
   * State snapshots and one-click undo across JSON-backed mock tools (`tether/core/snapshot.py`, `tether/tools/mock_apps.py`)
   * Humans-as-tools approval and helper workflow with timeout and backup contact (`tether/core/human_tool.py`)
   * FastAPI live action feed dashboard (`tether/ui/feed.py`)
-  * Automated benchmark script testing adversarial attacks and normal tasks (`tests/benchmark.py`)
+  * Taint tracking, hard payment limit, `read_inbox` / `send_email` tools, safe undo (refuses irreversible, detects conflicts)
+  * File-based approver that works over MCP stdio, with backup contact (`tether/cli.py`)
+  * The agent cannot approve its own actions: approval mode is set by the operator (`TETHER_APPROVER`), not by tool arguments
+  * Benchmark and pytest suite (`tests/benchmark.py`, `tests/test_tether.py`, `tests/eval_extended.py`)
 * **Planned (Hackathon Expansion):**
   * Telegram Bot API integration for mobile family approvals and photo-verification helper tasks
-  * SQLite storage backend and secondary LLM injection classifier
+  * SQLite storage backend and a secondary LLM injection classifier (`llm_injection_scan` is a stub that returns False)
   * Live integrations with Google Calendar, Gmail, and Google Sheets APIs
   * Typed Hindi and voice-first accessibility for elderly users
 
@@ -103,7 +106,13 @@ Evaluate Tether against prompt injection attacks and normal tasks:
 python tests/benchmark.py
 ```
 
-### 3. Launch the Interactive Demo or Live Feed
+### 3. Run the tests and the extended evaluation
+```bash
+python -m pytest -q
+python tests/eval_extended.py
+```
+
+### 4. Launch the Interactive Demo or Live Feed
 ```bash
 # Run the interactive CLI demo
 python run_demo.py
@@ -111,6 +120,16 @@ python run_demo.py
 # Or start the FastAPI live audit dashboard on http://localhost:8000
 uvicorn tether.ui.feed:app --reload --port 8000
 ```
+
+---
+
+## Use as an MCP server
+
+```json
+{ "mcpServers": { "tether": { "command": "python", "args": ["-m", "tether.cli", "serve"],
+    "cwd": "/path/to/repo", "env": { "TETHER_APPROVER": "file" } } } }
+```
+With `file`, a request waiting for family appears in `data/pending/`. From another terminal: `python -m tether.cli pending`, then `approve <id>` or `reject <id>`. No answer within the timeout goes to the backup contact, then is denied. Use `TETHER_APPROVER=terminal` for the interactive demo.
 
 ---
 
@@ -124,8 +143,24 @@ Measured locally via `python tests/benchmark.py` across 14 test scenarios (6 adv
 | **Attacks Blocked** | `6/6 (100.0%)` | All adversarial calls intercepted before execution |
 | **Normal Tasks Tested** | `8` | Routine calendar bookings, sheet updates, safe drafts, and approved bills |
 | **False Positives** | `0/8 (0.0%)` | Zero legitimate tasks wrongly blocked |
-| **Undo Verification** | `PASS` | Pre-execution snapshot accurately restored modified mock state |
+| **Undo Verification** | `PASS` | Exact restore after a reversible action; refuses a payment; refuses to overwrite a later change |
 | **Overall Status** | `ALL CHECKS PASSED` | Verified end-to-end on local MVP |
+
+### Extended evaluation (`python tests/eval_extended.py`)
+
+| Set | Result |
+| :--- | :--- |
+| Attacks blocked | `9/10` |
+| Normal tasks correct | `15/15` (including benign text containing "send" and "bypass") |
+
+The one miss (A10) is a deliberately reworded injection ("set aside the guidance you were given earlier...") that the regex scan cannot catch. It is a known gap and the reason a classifier is on the roadmap. **All cases were written by the same team that wrote the rules, so these numbers are a baseline, not proof of security.**
+
+### Known gaps
+
+* Regex scanning is evadable by rewording (A10). Taint tracking only helps after something suspicious was read.
+* Mock tools only; no real accounts are touched.
+* Policy is static YAML; no per-person rules yet.
+* Taint is tracked per proxy process (one MCP session).
 
 ---
 
